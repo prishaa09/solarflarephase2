@@ -1,0 +1,121 @@
+# ------- setup (run once in your environment) -------
+!pip install sunpy==5.1 "numpy<2" pandas astropy zeep drms
+
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from astropy import units as u
+from sunpy.net import Fido, attrs as a
+from sunpy import timeseries as ts
+
+# --------------- CONFIG ----------------
+START = "2015-01-01 00:00"     # <-- change as needed
+END   = "2017-12-31 23:59"     # <-- change as needed
+OUT_DIR = Path("./data_goes")
+CSV_NAME = f"goes_xrs_{START[:10]}_to_{END[:10]}_1min.csv"
+CADENCE = "1min"               # '1min' is standard for modeling
+MIN_ALLOWED = 0.0              # drop non-physical/negatives
+# --------------------------------------
+
+
+def fetch_goes_xrs(start: str, end: str):
+    """
+    Download GOES XRS science-quality data for the time range.
+    Returns a SunPy TimeSeries (which may be a concatenation of files).
+    """
+    res = Fido.search(a.Time(start, end), a.Instrument("XRS"))
+    files = Fido.fetch(res)
+    return ts.TimeSeries(files)
+
+
+def clean_to_dataframe(goes_ts: ts.TimeSeries, cadence="1min") -> pd.DataFrame:
+    """
+    Convert to a tidy pandas DataFrame, resample to target cadence,
+    apply simple quality filtering, and compute derived features.
+    """
+    # SunPy TimeSeries -> DataFrame (index = datetime)
+    df = goes_ts.to_dataframe()
+
+    # Column names vary slightly by satellite/product; standardize:
+    # Prefer long band (1-8 Å) and short band (0.5-4 Å)
+    # Try common keys, then fall back to substring matching
+    col_map = {
+        "long": None,   # 1-8 Å
+        "short": None,  # 0.5-4 Å
+        "quality": None,
+        "sat": None,
+    }
+
+    for c in df.columns:
+        cl = c.lower()
+        if col_map["long"] is None and ("1-8" in cl or "long" in cl or "xrsb" in cl):
+            col_map["long"] = c
+        if col_map["short"] is None and ("0.5-4" in cl or "short" in cl or "xrsa" in cl):
+            col_map["short"] = c
+        if col_map["quality"] is None and ("quality" in cl or "qc_flag" in cl):
+            col_map["quality"] = c
+        if col_map["sat"] is None and ("sat" in cl or "satellite" in cl):
+            col_map["sat"] = c
+
+    # Keep only needed columns
+    keep = [c for c in [col_map["short"], col_map["long"], col_map["quality"], col_map["sat"]] if c in df.columns]
+    df = df[keep].copy()
+
+    # Rename to stable names
+    rename_map = {}
+    if col_map["short"] in df.columns: rename_map[col_map["short"]] = "flux_0.5_4A"
+    if col_map["long"]  in df.columns: rename_map[col_map["long"]]  = "flux_1_8A"
+    if col_map["quality"] in df.columns: rename_map[col_map["quality"]] = "quality_flag"
+    if col_map["sat"] in df.columns: rename_map[col_map["sat"]] = "satellite_id"
+    df.rename(columns=rename_map, inplace=True)
+
+    # Ensure numeric + drop non-physical/negatives
+    for c in ["flux_0.5_4A", "flux_1_8A"]:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df.loc[df[c] < MIN_ALLOWED, c] = np.nan
+
+    # Basic quality filter if available (keep good or NaN)
+    if "quality_flag" in df:
+        # Different products encode quality differently; keep 0 or NaN as "good" default:
+        good = (df["quality_flag"].isna()) | (df["quality_flag"] == 0)
+        df = df.where(good)
+
+    # Resample to requested cadence (mean)
+    df = df.resample(cadence).mean()
+
+    # Compute derived features
+    if {"flux_0.5_4A", "flux_1_8A"}.issubset(df.columns):
+        df["flux_ratio_A_over_B"] = df["flux_0.5_4A"] / df["flux_1_8A"]
+        # Common rolling features (useful for anomalies/prediction)
+        for win in [5, 15, 30]:  # minutes
+            df[f"long_mean_{win}m"]  = df["flux_1_8A"].rolling(f"{win}min").mean()
+            df[f"long_std_{win}m"]   = df["flux_1_8A"].rolling(f"{win}min").std()
+            df[f"short_mean_{win}m"] = df["flux_0.5_4A"].rolling(f"{win}min").mean()
+
+    # Drop rows with no flux after processing
+    df = df.dropna(subset=[c for c in ["flux_1_8A", "flux_0.5_4A"] if c in df.columns], how="all")
+
+    # Add time as a column for easy CSV consumption
+    df = df.reset_index().rename(columns={"index": "time_utc"})
+    return df
+
+
+def save_csv(df: pd.DataFrame, out_dir: Path, name: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / name
+    df.to_csv(out_path, index=False)
+    print(f"Saved: {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    print(f"Fetching GOES XRS from {START} to {END} …")
+    goes_ts = fetch_goes_xrs(START, END)
+    df = clean_to_dataframe(goes_ts, cadence=CADENCE)
+    save_csv(df, OUT_DIR, CSV_NAME)
+
+    # Quick sanity prints
+    print(df.head(5))
+    print(df.describe(include='all'))
